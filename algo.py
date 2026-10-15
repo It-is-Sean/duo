@@ -590,14 +590,14 @@ class DUO(DUO_BASE):
                           device=self.device)
     return alpha_t * x + sigma_t * epsilon
 
-  def nll(self, x0, output_tokens,
+  def nll(self, x0, labels, output_tokens,
           current_accumulation_step=None, train_mode=False):
     use_true_nll = (self.global_step > self.curriculum_end
                     or not train_mode)
     if use_true_nll:
-      return super().nll(x0, output_tokens,
-                         current_accumulation_step)
-    del output_tokens
+      return super().nll(x0, labels, output_tokens,
+                         current_accumulation_step, train_mode)
+    del labels, output_tokens
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     gamma_t = self.gamma_min + t * (self.gamma_max
                                     - self.gamma_min)
