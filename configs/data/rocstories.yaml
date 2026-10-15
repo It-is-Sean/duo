@@ -1,0 +1,9 @@
+train: rocstories
+valid: rocstories
+modality: text
+tokenizer_name_or_path: gpt2
+cache_dir: /cache/yunchenjiang/datasets/ROCStories-winter-2017/tokenized-gpt2-l64-packed
+wrap: True
+streaming: False
+insert_train_eos: True
+insert_valid_eos: True
