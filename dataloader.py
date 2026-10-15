@@ -54,14 +54,12 @@ class PackedROCStories(torch.utils.data.Dataset):
     self.dtype = np.dtype(dtype_name)
     self.block_size = block_size
     token_count = os.path.getsize(path) // self.dtype.itemsize
-    if token_count % block_size != 0:
-      raise ValueError(
-        f'{path} has {token_count} tokens, which is not divisible by '
-        f'block_size={block_size}')
     self.num_blocks = token_count // block_size
+    dropped_tokens = token_count % block_size
     self._tokens = None
     LOGGER.info(
-      f'ROCStories {split}: {self.num_blocks:,} packed blocks from {path}')
+      f'ROCStories {split}: {self.num_blocks:,} packed blocks from {path}; '
+      f'dropped tail tokens={dropped_tokens}')
 
   def _memmap(self):
     if self._tokens is None:
