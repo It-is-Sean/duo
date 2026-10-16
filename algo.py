@@ -1,4 +1,5 @@
 import os
+import math
 import collections
 import copy
 import pickle
@@ -534,7 +535,7 @@ class DUO(DUO_BASE):
 
   def training_step(self, batch, batch_idx):
     self.log(name='gumbel_tau_log10',
-             value=1 / self._compute_gumbel_tau_inverse(),
+             value=-math.log10(self._compute_gumbel_tau_inverse()),
              on_step=True,
              on_epoch=False,
              sync_dist=True)
@@ -592,7 +593,7 @@ class DUO(DUO_BASE):
 
   def nll(self, x0, labels, output_tokens,
           current_accumulation_step=None, train_mode=False):
-    use_true_nll = (self.global_step > self.curriculum_end
+    use_true_nll = (self.global_step >= self.curriculum_end
                     or not train_mode)
     if use_true_nll:
       return super().nll(x0, labels, output_tokens,

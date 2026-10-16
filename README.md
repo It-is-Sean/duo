@@ -71,6 +71,40 @@ pip install flash_attn==2.7.4.post1
 # Training
 <a name="training"></a>
 
+## ROCStories small-data adaptation
+
+The MSEFlow launcher now reads the same `paper-packed-v1` binary cache as
+LangFlow: document-level train/validation split, untruncated documents with EOS,
+62-token packed payloads wrapped in BOS/EOS, and all 64 positions valid. Build
+this cache from raw CSV using LangFlow's data preparation first; old truncated
+story arrays cannot reconstruct it. Legacy story-aligned caches remain readable
+for old configurations, but cannot be resumed into a new packed experiment.
+
+`rocstories.py` derives the schedule from the actual packed block count. With
+41,310 train blocks and global batch 128, each epoch has 322 complete updates;
+20 epochs have 6,440 updates and the Gaussian curriculum ends at 3,220. The
+shuffled 94-block tail is dropped each epoch, avoiding partial accumulated
+updates. Validation intervals are **microbatches**, while LR, curriculum and
+checkpoint intervals are **optimizer updates**. Defaults are LR 3e-4 with 400
+warmup updates, tau 1e-3, gamma [-3.5,-1.75], and the upstream update-adaptive
+EMA capped at 0.9999. These are adaptation defaults, not proven optimal settings.
+
+Packed evaluation generates full blocks, retaining EOS instead of applying the
+legacy sampled-length/forced-EOS evaluator. Cache fingerprints guard against
+mixing protocols. Short ROCStories runs test the pipeline; they are not a
+replication of million-update LM1B/OWT quality numbers.
+
+Regression commands (from this directory):
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+python tests/smoke_rocstories.py
+```
+
+The CPU smoke test uses cached GPT-2 tokenizers and a tiny DiT with temporary
+outputs. It checks mid-epoch resumed sample order, not bitwise-identical model
+weights after distributed resume.
+
 This repo implements the original Duo curriculum, as well as the fast $\text{Duo}^\text{++}$ curriculum. By default, the training scripts use the original curriculum. To enable the efficient curriculum, simply replace `algo.curriculum.mode=simple` by `algo.curriculum.mode=poly9` (see comments in each training script).
 
 To train $\text{Duo}^\text{++}$, use the following scripts:

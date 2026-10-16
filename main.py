@@ -186,6 +186,13 @@ def _train(diffusion_model, config, logger, tokenizer):
   else:
     ckpt_path = None
 
+  if config.data.get('protocol') == 'paper-packed-v1':
+    if config.checkpointing.resume_from_ckpt and ckpt_path is None:
+      raise FileNotFoundError('Requested packed resume checkpoint does not exist')
+    checkpoint_dir = os.path.join(config.checkpointing.save_dir, 'checkpoints')
+    if ckpt_path is None and os.path.isdir(checkpoint_dir) and os.listdir(checkpoint_dir):
+      raise ValueError('Output already has checkpoints; resume or select a new run directory')
+
   # Lightning callbacks
   callbacks = []
   if 'callbacks' in config:

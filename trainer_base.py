@@ -12,6 +12,7 @@ import dataloader
 import metrics
 import models
 import utils
+from rocstories import PROTOCOL, FullGlobalBatchSampler, read_metadata
 
 
 @dataclass
@@ -81,6 +82,9 @@ class TrainerBase(L.LightningModule):
     super().__init__()
     self.save_hyperparameters()
     self.config = config
+    self.packed_fingerprint = None
+    if config.data.get('protocol') == PROTOCOL:
+      self.packed_fingerprint = read_metadata(config.data.cache_dir)['fingerprint']
     if hasattr(self.config.algo, 'ignore_bos'):
       self.ignore_bos = config.algo.ignore_bos
     else:
@@ -184,6 +188,24 @@ class TrainerBase(L.LightningModule):
     self.noise.train()
 
   def on_load_checkpoint(self, checkpoint):
+    if self.packed_fingerprint is not None:
+      if checkpoint.get('rocstories_fingerprint') != self.packed_fingerprint:
+        raise ValueError('Cannot resume legacy or different packed data; start a new run')
+      saved = checkpoint['hyper_parameters']['config']
+      for section, key in (('loader', 'global_batch_size'), ('loader', 'batch_size'),
+                           ('trainer', 'devices'), ('trainer', 'num_nodes'),
+                           ('trainer', 'accumulate_grad_batches'), ('optim', 'lr'),
+                           ('training', 'ema'), ('lr_scheduler', 'num_warmup_steps')):
+        if saved[section][key] != self.config[section][key]:
+          raise ValueError(f'Resume requires unchanged {section}.{key}')
+      if (saved.algo.curriculum != self.config.algo.curriculum
+          or saved.model != self.config.model or saved.seed != self.config.seed):
+        raise ValueError('Resume requires unchanged model, seed and curriculum')
+      self.fast_forward_epochs = checkpoint['packed_progress']['epoch']
+      self.fast_forward_batches = checkpoint['packed_progress']['batches']
+      if self.ema:
+        self.ema.load_state_dict(checkpoint['ema'])
+      return
     if self.ema:
       self.ema.load_state_dict(checkpoint['ema'])
     # Copied from:
@@ -197,6 +219,13 @@ class TrainerBase(L.LightningModule):
   def on_save_checkpoint(self, checkpoint):
     if self.ema:
       checkpoint['ema'] = self.ema.state_dict()
+    if self.packed_fingerprint is not None:
+      checkpoint['rocstories_fingerprint'] = self.packed_fingerprint
+      checkpoint['packed_progress'] = {
+        'epoch': self.current_epoch, 'batches': self._packed_next_batch}
+      # Lightning owns its loop counters. Reconstructing them by multiplying
+      # optimizer steps by accumulation breaks at partial/end-of-epoch batches.
+      return
     # Copied from:
     # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
     # ['epoch_loop.batch_progress']['total']['completed']
@@ -236,6 +265,16 @@ class TrainerBase(L.LightningModule):
   def on_train_start(self):
     if self.ema:
       self.ema.move_shadow_params_to_device(self.device)
+    if self.packed_fingerprint is not None:
+      for dl in self.trainer.fit_loop._combined_loader.flattened:
+        if not isinstance(dl.sampler, FullGlobalBatchSampler):
+          raise ValueError('Packed training requires the full-global-batch sampler')
+        if self.fast_forward_batches is not None:
+          dl.sampler.set_epoch(self.fast_forward_epochs)
+          dl.sampler.start_index = self.fast_forward_batches * dl.batch_size
+          if not 0 <= dl.sampler.start_index <= dl.sampler.num_samples:
+            raise ValueError('Invalid packed checkpoint data position')
+      return
     # Adapted from:
     # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
     distributed = (
@@ -267,7 +306,7 @@ class TrainerBase(L.LightningModule):
           pin_memory=self.config.loader.pin_memory,
           sampler=dl_sampler,
           shuffle=False,
-          persistent_workers=True))
+          persistent_workers=self.config.loader.num_workers > 0))
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
   def optimizer_step(self, *args, **kwargs):
@@ -302,11 +341,13 @@ class TrainerBase(L.LightningModule):
       model_output=model_output, xt=xt, sigma=sigma)
 
   def on_train_epoch_start(self):
-    self.metrics.reset()
+    self.metrics.train_nlls.reset()
+    self.metrics.train_aux.reset()
     assert self.metrics.train_nlls.nll.mean_value == 0
     assert self.metrics.train_nlls.nll.weight == 0
 
   def training_step(self, batch, batch_idx):
+    self._packed_next_batch = batch_idx + 1
     current_accumulation_step = (
       batch_idx % self.trainer.accumulate_grad_batches)
     losses = self._loss(batch['input_ids'],
@@ -324,21 +365,30 @@ class TrainerBase(L.LightningModule):
     return losses.loss
 
   def on_train_epoch_end(self):
-    for k, v in self.metrics.valid_nlls.items():
+    if self.metrics.train_nlls.nll.weight == 0:
+      return
+    for k, v in self.metrics.train_nlls.items():
       self.log(name=k, value=v.compute(), on_step=False,
                on_epoch=True, sync_dist=True)
 
   def on_validation_epoch_start(self):
-    self.metrics.reset()
+    self.metrics.valid_nlls.reset()
+    self.metrics.valid_aux.reset()
+    self.metrics.gen_ppl.reset()
+    self.metrics.sample_entropy.reset()
     self._eval_mode()
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
-    del batch_idx
-    losses = self._loss(batch['input_ids'],
-                        batch.get('labels', None),
-                        batch['attention_mask'])
+    # Stable Monte Carlo diagnostics on a small validation split. Forking RNG
+    # also prevents validation frequency from changing training randomness.
+    devices = [self.device.index] if self.device.type == 'cuda' else []
+    with torch.random.fork_rng(devices=devices):
+      torch.manual_seed(self.config.seed + 10000 + self.global_rank * 1000000 + batch_idx)
+      losses = self._loss(batch['input_ids'],
+                          batch.get('labels', None),
+                          batch['attention_mask'])
     self.metrics.update_valid(losses.nlls, losses.prior_loss,
                               losses.num_tokens)
     return losses.loss

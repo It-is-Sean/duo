@@ -2,7 +2,8 @@ train: rocstories
 valid: rocstories
 modality: text
 tokenizer_name_or_path: gpt2
-cache_dir: /cache/yunchenjiang/datasets/ROCStories-winter-2017/tokenized-gpt2-l64
+cache_dir: /cache/yunchenjiang/datasets/ROCStories-winter-2017/paper-packed-gpt2-l64
+protocol: paper-packed-v1
 wrap: True
 streaming: False
 insert_train_eos: True
