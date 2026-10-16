@@ -405,15 +405,26 @@ class TrainerBase(L.LightningModule):
   def generate_samples(self, num_samples, num_steps, eps):
     raise NotImplementedError
 
-  def restore_model_and_sample(self, num_steps, eps=1e-5):
+  def restore_model_and_sample(
+      self, num_steps, eps=1e-5, attention_mask=None, eos_token_id=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     self._eval_mode()
-    samples = self.generate_samples(
-      num_samples=self.config.loader.eval_batch_size,
-      num_steps=num_steps,
-      eps=eps)
-    self._train_mode()
+    previous_attention_mask = getattr(
+      self, '_loss_attention_mask', None)
+    if attention_mask is not None:
+      attention_mask = attention_mask.to(device=self.device, dtype=torch.bool)
+    self._loss_attention_mask = attention_mask
+    try:
+      samples = self.generate_samples(
+        num_samples=self.config.loader.eval_batch_size,
+        num_steps=num_steps,
+        eps=eps,
+        attention_mask=attention_mask,
+        eos_token_id=eos_token_id)
+    finally:
+      self._loss_attention_mask = previous_attention_mask
+      self._train_mode()
     return samples
 
   def _process_model_input(self, x0, valid_tokens):
@@ -754,12 +765,21 @@ class Diffusion(TrainerBase):
 
   @torch.no_grad()
   def generate_samples(self, num_samples, labels=None,
-                       num_steps=None, eps=1e-5):
+                       num_steps=None, eps=1e-5,
+                       attention_mask=None, eos_token_id=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
     x = self.prior_sample(num_samples, self.num_tokens)
+    if attention_mask is not None:
+      if attention_mask.shape != x.shape:
+        raise ValueError(
+          f'attention_mask must have shape {tuple(x.shape)}, got '
+          f'{tuple(attention_mask.shape)}')
+      if eos_token_id is None:
+        raise ValueError('eos_token_id is required with attention_mask')
+      x = x.masked_fill(~attention_mask, eos_token_id)
     use_psi_sampler = self.config.sampling.predictor == 'psi'
     timesteps = self._get_sampling_time_profile(eps, 
                                                 num_steps)
@@ -795,6 +815,8 @@ class Diffusion(TrainerBase):
         x = self._analytic_update(x=x,t=t, dt=dt)
       else:
         raise ValueError(self.sampler)
+      if attention_mask is not None:
+        x = x.masked_fill(~attention_mask, eos_token_id)
 
     t0 = timesteps[-1] * torch.ones(x.shape[0], 1,
                                     device=self.device)
@@ -807,6 +829,14 @@ class Diffusion(TrainerBase):
     elif self.config.sampling.noise_removal == 'greedy':
       sigma = self._sigma_from_alphat(self.noise(t0)[1])
       x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
+    if attention_mask is not None:
+      x = x.masked_fill(~attention_mask, eos_token_id)
+      terminal_positions = attention_mask.sum(dim=1) - 1
+      x.scatter_(
+        1, terminal_positions[:, None],
+        torch.full(
+          (num_samples, 1), eos_token_id,
+          dtype=x.dtype, device=x.device))
     return x
 
   @torch.no_grad
