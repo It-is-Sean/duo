@@ -27,57 +27,64 @@ import utils
 LOGGER = utils.get_logger(__name__)
 
 
-class PackedROCStories(torch.utils.data.Dataset):
-  """Fixed-length ROCStories blocks produced by LangFlow's cache builder.
+class ROCStories(torch.utils.data.Dataset):
+  """Story-aligned ROCStories examples produced by LangFlow's AR cache.
 
-  The packed representation contains only real GPT-2 tokens, including EOS
-  document boundaries, so the bidirectional denoiser never attends to padding.
-  Files are memory-mapped independently in each dataloader worker.
+  Each row contains exactly one five-sentence story: at most ``block_size - 1``
+  GPT-2 tokens followed by one EOS token. Remaining positions contain EOS as a
+  storage sentinel and are excluded from both attention and loss by the mask.
   """
 
   def __init__(self, cache_dir, split, block_size):
-    path = os.path.join(cache_dir, f'{split}.bin')
+    token_path = os.path.join(cache_dir, f'{split}-tokens.npy')
+    length_path = os.path.join(cache_dir, f'{split}-lengths.npy')
     metadata_path = os.path.join(cache_dir, 'metadata.json')
-    if not os.path.isfile(path):
-      raise FileNotFoundError(f'ROCStories packed split not found: {path}')
+    if not os.path.isfile(token_path):
+      raise FileNotFoundError(
+        f'ROCStories story-aligned tokens not found: {token_path}')
+    if not os.path.isfile(length_path):
+      raise FileNotFoundError(
+        f'ROCStories story-aligned lengths not found: {length_path}')
     if not os.path.isfile(metadata_path):
       raise FileNotFoundError(
-        f'ROCStories packed metadata not found: {metadata_path}')
+        f'ROCStories story-aligned metadata not found: {metadata_path}')
     with open(metadata_path, encoding='utf-8') as handle:
       metadata = json.load(handle)
-    dtype_name = metadata.get('fingerprint', {}).get('dtype')
-    if dtype_name not in {'uint16', 'uint32'}:
+    cache_block_size = metadata.get('fingerprint', {}).get('max_length')
+    if cache_block_size != block_size:
       raise ValueError(
-        f'Unsupported ROCStories token dtype {dtype_name!r} in '
-        f'{metadata_path}')
-    self.path = path
-    self.dtype = np.dtype(dtype_name)
+        f'ROCStories cache max_length={cache_block_size!r} does not match '
+        f'model.length={block_size}')
+    self.tokens = np.load(token_path, mmap_mode='r')
+    self.lengths = np.load(length_path, mmap_mode='r')
+    if self.tokens.ndim != 2 or self.tokens.shape[1] != block_size:
+      raise ValueError(
+        f'Expected ROCStories tokens with shape [N, {block_size}], got '
+        f'{self.tokens.shape}')
+    if self.lengths.ndim != 1 or len(self.lengths) != len(self.tokens):
+      raise ValueError(
+        f'ROCStories token/length count mismatch: {len(self.tokens)} vs '
+        f'{len(self.lengths)}')
     self.block_size = block_size
-    token_count = os.path.getsize(path) // self.dtype.itemsize
-    self.num_blocks = token_count // block_size
-    dropped_tokens = token_count % block_size
-    self._tokens = None
     LOGGER.info(
-      f'ROCStories {split}: {self.num_blocks:,} packed blocks from {path}; '
-      f'dropped tail tokens={dropped_tokens}')
-
-  def _memmap(self):
-    if self._tokens is None:
-      self._tokens = np.memmap(
-        self.path, dtype=self.dtype, mode='r',
-        shape=(self.num_blocks, self.block_size))
-    return self._tokens
+      f'ROCStories {split}: {len(self.lengths):,} story-aligned examples from '
+      f'{token_path}')
 
   def __len__(self):
-    return self.num_blocks
+    return len(self.lengths)
 
   def __getitem__(self, index):
     # Copy before converting so PyTorch never receives a read-only memmap view.
     input_ids = torch.from_numpy(
-      np.array(self._memmap()[index], dtype=np.int64, copy=True))
+      np.array(self.tokens[index], dtype=np.int64, copy=True))
+    length = int(self.lengths[index])
+    if not 1 <= length <= self.block_size:
+      raise ValueError(
+        f'Invalid ROCStories sequence length {length} at index {index}')
     return {
       'input_ids': input_ids,
-      'attention_mask': torch.ones(self.block_size, dtype=torch.float32),
+      'attention_mask': (
+        torch.arange(self.block_size) < length).to(torch.float32),
     }
 
 
@@ -554,12 +561,12 @@ def get_dataset(dataset_name,
       raise ValueError(
         f'ROCStories supports train/validation, received mode={mode!r}')
     if not wrap:
-      raise ValueError('Packed ROCStories must use data.wrap=true')
+      raise ValueError('Story-aligned ROCStories must use data.wrap=true')
     if not insert_eos:
       raise ValueError(
-        'Packed ROCStories already contains EOS boundaries; '
+        'Story-aligned ROCStories already contains a terminal EOS; '
         'data.insert_*_eos must remain true')
-    return PackedROCStories(cache_dir, mode, block_size)
+    return ROCStories(cache_dir, mode, block_size)
   if dataset_name == 'cifar10':
     assert mode in ('train', 'validation')
     return DiscreteCIFAR10(cache_dir=cache_dir, 

@@ -287,10 +287,17 @@ class TrainerBase(L.LightningModule):
       nn_input_idxs = xt
 
     sigma = self._process_sigma(sigma)
+    attention_mask = getattr(self, '_loss_attention_mask', None)
     with torch.amp.autocast('cuda', dtype=torch.float32):
-      model_output = self.backbone(
-        x=nn_input_idxs, sigma=sigma, class_cond=labels, 
-        weights=weights)
+      backbone_kwargs = {
+        'x': nn_input_idxs,
+        'sigma': sigma,
+        'class_cond': labels,
+        'weights': weights,
+      }
+      if self.config.algo.backbone == 'dit':
+        backbone_kwargs['attention_mask'] = attention_mask
+      model_output = self.backbone(**backbone_kwargs)
     return self._process_model_output(
       model_output=model_output, xt=xt, sigma=sigma)
 
@@ -422,8 +429,14 @@ class TrainerBase(L.LightningModule):
     (input_tokens, output_tokens,
      valid_tokens) = self._process_model_input(
        x0, valid_tokens)
-    loss = self.nll(input_tokens, labels, output_tokens,
-                    current_accumulation_step, train_mode)
+    previous_attention_mask = getattr(
+      self, '_loss_attention_mask', None)
+    self._loss_attention_mask = valid_tokens
+    try:
+      loss = self.nll(input_tokens, labels, output_tokens,
+                      current_accumulation_step, train_mode)
+    finally:
+      self._loss_attention_mask = previous_attention_mask
     assert loss.ndim == 2
     if self.ignore_bos:
       loss[:, 1:] = loss[:, 1:]

@@ -131,14 +131,20 @@ def apply_rotary_pos_emb(qkv, cos, sin):
   return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
 
 
-def regular_attention_multi_headed(q, k, v):
+def regular_attention_multi_headed(q, k, v, attention_mask=None):
   # Assuming qkv is a tensor with shape [batch, seq_len, 3, num_heads, head_dim]
   # where the 3 represents Q, K, V packed in that order
+  if attention_mask is not None:
+    if attention_mask.ndim != 2:
+      raise ValueError(
+        f'attention_mask must have shape [batch, seq_len], got '
+        f'{attention_mask.shape}')
+    attention_mask = attention_mask[:, None, None, :].to(torch.bool)
   attention_output = F.scaled_dot_product_attention(
     query=q.transpose(1, 2),
     key=k.transpose(1, 2),
     value=v.transpose(1, 2),
-    attn_mask=None,
+    attn_mask=attention_mask,
     dropout_p=0.0,
     is_causal=False)
   # [batch_size, seq_len, num_heads, head_dim]
@@ -336,7 +342,7 @@ class DDiTBlock(nn.Module):
       return bias_dropout_add_scale_fused_inference
 
 
-  def forward(self, x, rotary_cos_sin, c=None):
+  def forward(self, x, rotary_cos_sin, c=None, attention_mask=None):
 
     bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
@@ -358,7 +364,7 @@ class DDiTBlock(nn.Module):
       h=self.n_heads)
     q, k, v = split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin)
     
-    x = regular_attention_multi_headed(q, k, v)
+    x = regular_attention_multi_headed(q, k, v, attention_mask)
 
     if self.adaLN:
       x = bias_dropout_scale_fn(self.attn_out(x),
@@ -474,7 +480,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, x, sigma, class_cond=None, weights=None):
+  def forward(self, x, sigma, class_cond=None, weights=None,
+              attention_mask=None):
     assert class_cond is None, 'Not implemented for DiT'
     x = self.vocab_embed(x, weights)
     if self.causal:
@@ -485,7 +492,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     rotary_cos_sin = self.rotary_emb(x)
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
-        x = self.blocks[i](x, rotary_cos_sin, c=t_cond)
+        x = self.blocks[i](
+          x, rotary_cos_sin, c=t_cond, attention_mask=attention_mask)
       x = self.output_layer(x, c=t_cond)
 
     return x
